@@ -75,6 +75,7 @@ set(libtorrent_include_files
 	magnet_uri.hpp
 	mmap_disk_io.hpp
 	mmap_storage.hpp
+	io_uring_disk_io.hpp
 	natpmp.hpp
 	netlink.hpp
 	operations.hpp
@@ -265,6 +266,8 @@ set(libtorrent_aux_include_files
 	socket_type.hpp
 	storage_free_list.hpp
 	storage_utils.hpp
+	io_uring_storage.hpp
+	io_uring_socket.hpp
 	string_ptr.hpp
 	strview_less.hpp
 	suggest_piece.hpp
@@ -372,6 +375,9 @@ set(sources
 	posix_disk_io.cpp
 	posix_part_file.cpp
 	posix_storage.cpp
+	io_uring_disk_io.cpp
+	io_uring_storage.cpp
+	io_uring_socket.cpp
 	proxy_base.cpp
 	proxy_settings.cpp
 	puff.cpp
@@ -611,6 +617,42 @@ target_link_libraries(torrent-rasterbar
 	PUBLIC
 		Threads::Threads
 )
+
+# io_uring support (Linux only)
+# Set -Duse_io_uring=ON    to make io_uring the *default* disk backend.
+# Set -Duse_io_uring_net=ON to make io_uring the *default* network backend.
+# Both require liburing >= 2.0.
+option(use_io_uring     "Use io_uring as the default disk I/O backend (Linux only)"    OFF)
+option(use_io_uring_net "Use io_uring as the default network I/O backend (Linux only)" OFF)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	find_library(LIBURING_LIBRARY NAMES uring)
+	find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+	if (LIBURING_LIBRARY AND LIBURING_INCLUDE_DIR)
+		message(STATUS "Found liburing: ${LIBURING_LIBRARY}")
+		target_include_directories(torrent-rasterbar
+			PUBLIC  ${LIBURING_INCLUDE_DIR}
+		)
+		target_link_libraries(torrent-rasterbar PRIVATE ${LIBURING_LIBRARY})
+		if (use_io_uring)
+			message(STATUS "io_uring: enabled as default disk backend")
+			target_compile_definitions(torrent-rasterbar
+				PUBLIC TORRENT_USE_IO_URING=1)
+		else()
+			message(STATUS "io_uring: disk backend available (opt-in via session_params)")
+		endif()
+		if (use_io_uring_net)
+			message(STATUS "io_uring: enabled as default network backend")
+			target_compile_definitions(torrent-rasterbar
+				PUBLIC TORRENT_USE_IO_URING_NET=1)
+		else()
+			message(STATUS "io_uring: network backend available (opt-in)")
+		endif()
+	else()
+		message(STATUS "liburing not found, disabling io_uring support")
+		target_compile_definitions(torrent-rasterbar PRIVATE TORRENT_HAVE_IO_URING=0)
+	endif()
+endif()
 
 # Unconditional platform-specific settings
 if (WIN32)

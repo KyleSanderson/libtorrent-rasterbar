@@ -1129,6 +1129,12 @@ bool ssl_server_name_callback(ssl::stream_handle_type stream_handle, std::string
 		// close the listen sockets
 		for (auto const& l : m_listen_sockets)
 		{
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+			// Cancel the multishot accept SQE before closing the fd so
+			// io_uring doesn't try to use a closed file descriptor.
+			if (l->uring_accept_token != aux::io_uring_event_loop::no_token)
+				m_uring_net.cancel(l->uring_accept_token);
+#endif
 			if (l->sock)
 			{
 				l->sock->close(ec);
@@ -2151,6 +2157,12 @@ namespace {
 			}
 #endif
 			if ((*remove_iter)->sock) (*remove_iter)->sock->close(ec);
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+			// Cancel the multishot accept SQE before close() so io_uring
+			// doesn't reference a freed fd.
+			if ((*remove_iter)->uring_accept_token != aux::io_uring_event_loop::no_token)
+				m_uring_net.cancel((*remove_iter)->uring_accept_token);
+#endif
 			if ((*remove_iter)->udp_sock) (*remove_iter)->udp_sock->sock.close();
 			if ((*remove_iter)->natpmp_mapper) (*remove_iter)->natpmp_mapper->close();
 			if ((*remove_iter)->upnp_mapper) (*remove_iter)->upnp_mapper->close();
@@ -2721,6 +2733,77 @@ namespace {
 		std::weak_ptr<tcp::acceptor> ls(listener);
 		m_stats_counters.inc_stats_counter(counters::num_outstanding_accept);
 		ADD_OUTSTANDING_ASYNC("session_impl::on_accept_connection");
+
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+		if (m_uring_net.is_initialized())
+		{
+			// Find the listen_socket_t that owns this acceptor, so we can
+			// store the cancel token for later cleanup.
+			auto lit = std::find_if(m_listen_sockets.begin(), m_listen_sockets.end()
+				, [&listener](std::shared_ptr<listen_socket_t> const& l)
+				{ return l->sock == listener; });
+
+			// Allocate the addr storage on the heap — it outlives this frame
+			// and is reused across multiple multishot callbacks.
+			auto* peer_addr   = new sockaddr_storage{};
+			auto* peer_addrlen = new socklen_t{sizeof(sockaddr_storage)};
+
+			auto tok = m_uring_net.async_accept_multishot(
+				listener->native_handle()
+				, reinterpret_cast<struct sockaddr*>(peer_addr), peer_addrlen
+				, [this, ls, ssl, peer_addr, peer_addrlen]
+				  (int new_fd, struct sockaddr*, socklen_t, error_code const& ec, bool more)
+				{
+					if (!more)
+					{
+						// Multishot ended — free heap storage.
+						delete peer_addr;
+						delete peer_addrlen;
+					}
+					if (ec || new_fd < 0)
+					{
+						// No socket to deliver.  Only the final completion
+						// decrements the outstanding-accept counter (since
+						// on_accept_connection won't be called this time).
+						if (!more)
+							m_stats_counters.inc_stats_counter(
+								counters::num_outstanding_accept, -1);
+						return;
+					}
+
+					// Wrap the raw fd into a true_tcp_socket so the rest of the
+					// pipeline is unchanged.
+					error_code assign_ec;
+					true_tcp_socket s(m_io_context);
+					s.assign(tcp::v4(), new_fd, assign_ec);
+					if (assign_ec)
+					{
+						::close(new_fd);
+						// If this is the final completion, account for the counter
+						// that on_accept_connection would have decremented.
+						if (!more)
+							m_stats_counters.inc_stats_counter(
+								counters::num_outstanding_accept, -1);
+						return;
+					}
+					// For intermediate completions (more==true) compensate
+					// because on_accept_connection will decrement the counter —
+					// we want it to stay at 1 while the multishot is still alive.
+					if (more)
+					{
+						m_stats_counters.inc_stats_counter(
+							counters::num_outstanding_accept);
+						ADD_OUTSTANDING_ASYNC("session_impl::on_accept_connection");
+					}
+					wrap(&session_impl::on_accept_connection
+						, std::move(s), error_code{}, ls, ssl);
+				});
+
+			if (lit != m_listen_sockets.end())
+				(*lit)->uring_accept_token = tok;
+			return;
+		}
+#endif
 		listener->async_accept([this, ls, ssl] (error_code const& ec, true_tcp_socket s)
 			{ return wrap(&session_impl::on_accept_connection, std::move(s), ec, ls, ssl); });
 	}
@@ -2817,7 +2900,22 @@ namespace {
 			}
 			return;
 		}
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+		{
+			// In the io_uring multishot path the SQE re-arms itself automatically;
+			// skip the manual async_accept re-arm so we don't launch a duplicate.
+			auto lisn = std::find_if(m_listen_sockets.begin(), m_listen_sockets.end()
+				, [&listener](std::shared_ptr<listen_socket_t> const& l)
+				{ return l->sock == listener; });
+			bool const multishot_active =
+				lisn != m_listen_sockets.end()
+				&& (*lisn)->uring_accept_token != aux::io_uring_event_loop::no_token;
+			if (!multishot_active)
+				async_accept(listener, ssl);
+		}
+#else
 		async_accept(listener, ssl);
+#endif
 
 		// don't accept any connections from our local listen sockets if we're
 		// using a proxy. We should only accept peers via the proxy, never

@@ -42,6 +42,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/disk_interface.hpp"
 #include "libtorrent/mmap_disk_io.hpp"
 #include "libtorrent/posix_disk_io.hpp"
+#if TORRENT_HAVE_IO_URING
+#include "libtorrent/io_uring_disk_io.hpp"
+#endif
 #include "libtorrent/platform_util.hpp"
 
 namespace libtorrent {
@@ -536,7 +539,12 @@ namespace {
 	TORRENT_EXPORT std::unique_ptr<disk_interface> default_disk_io_constructor(
 		io_context& ios, settings_interface const& sett, counters& cnt)
 	{
-#if TORRENT_HAVE_MMAP || TORRENT_HAVE_MAP_VIEW_OF_FILE
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING)
+		// When built with -Duse_io_uring=ON, prefer the io_uring backend over
+		// the mmap/posix backend.  Users (qBittorrent, etc.) can also select
+		// it explicitly by setting session_params::disk_io_constructor.
+		return io_uring_disk_io_constructor(ios, sett, cnt);
+#elif TORRENT_HAVE_MMAP || TORRENT_HAVE_MAP_VIEW_OF_FILE
 		// TODO: In C++17. use if constexpr instead
 #include "libtorrent/aux_/disable_deprecation_warnings_push.hpp"
 		if (sizeof(void*) == 8)

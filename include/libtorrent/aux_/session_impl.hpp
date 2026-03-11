@@ -92,6 +92,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/flags.hpp"
 #include "libtorrent/span.hpp"
 
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+#include "libtorrent/aux_/io_uring_socket.hpp"
+#endif
+
 #if TORRENT_ABI_VERSION == 1
 #include "libtorrent/session_settings.hpp"
 #endif
@@ -279,6 +283,12 @@ namespace aux {
 		// set to true when we receive an incoming connection from this listen
 		// socket
 		bool incoming_connection = false;
+
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+		// cancel token for the io_uring multishot accept, if active
+		aux::io_uring_event_loop::cancel_token uring_accept_token
+			= aux::io_uring_event_loop::no_token;
+#endif
 	};
 
 		struct TORRENT_EXTRA_EXPORT listen_endpoint_t
@@ -914,6 +924,11 @@ namespace aux {
 
 			io_context& m_io_context;
 
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+				// io_uring event loop for the network backend.
+				// Accepts incoming TCP connections via multishot accept.
+				aux::io_uring_event_loop m_uring_net{m_io_context};
+#endif
 #if TORRENT_USE_SSL
 			// this is a generic SSL context used when talking to HTTPS servers
 			ssl::context m_ssl_ctx;

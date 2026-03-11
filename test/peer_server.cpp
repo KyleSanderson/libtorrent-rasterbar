@@ -42,6 +42,14 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "peer_server.hpp"
 #include "test_utils.hpp"
 
+#include "libtorrent/config.hpp"
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+#include "libtorrent/aux_/io_uring_socket.hpp"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#endif
+
 #include <functional>
 #include <thread>
 #include <atomic>
@@ -57,6 +65,11 @@ struct peer_server
 	std::atomic<int> m_peer_requests{0};
 	tcp::acceptor m_acceptor{m_ios};
 	int m_port = 0;
+
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+	lt::aux::io_uring_event_loop m_uring_loop{m_ios};
+	std::atomic<bool>            m_stopping{false};
+#endif
 
 	std::shared_ptr<std::thread> m_thread;
 
@@ -99,6 +112,10 @@ struct peer_server
 		error_code ignore;
 		m_acceptor.cancel(ignore);
 		m_acceptor.close(ignore);
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+		m_stopping.store(true, std::memory_order_release);
+		m_uring_loop.stop();
+#endif
 		if (m_thread) m_thread->join();
 	}
 
@@ -114,6 +131,34 @@ struct peer_server
 
 	void thread_fun()
 	{
+#if TORRENT_HAVE_IO_URING && defined(TORRENT_USE_IO_URING_NET)
+		if (m_uring_loop.is_initialized())
+		{
+			// io_uring path: use multishot accept so one SQE serves all connections.
+			struct sockaddr_in peer_addr{};
+			socklen_t peer_addrlen = sizeof(peer_addr);
+			m_uring_loop.async_accept_multishot(
+				m_acceptor.native_handle(),
+				reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_addrlen,
+				[this](int new_fd, struct sockaddr*, socklen_t, lt::error_code ec, bool)
+				{
+					if (!ec && new_fd >= 0)
+					{
+						std::printf("%s: PEER [io_uring] incoming peer connection fd=%d\n"
+							, time_now_string().c_str(), new_fd);
+						++m_peer_requests;
+						::close(new_fd);
+					}
+				});
+			// Drain ios until destructor sets m_stopping.
+			while (!m_stopping.load(std::memory_order_acquire))
+			{
+				m_ios.poll_one();
+				m_ios.restart();
+			}
+			return;
+		}
+#endif
 		for (;;)
 		{
 			error_code ec;
