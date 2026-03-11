@@ -931,6 +931,14 @@ endif()
 # There is little to none support for using pkg-config with MSVC and most users won't bother with it.
 # However, msys is a linux-like platform on Windows that do support/prefer using pkg-config.
 if (NOT MSVC)
+	# Normalise CMAKE_INSTALL_LIBDIR to a relative path before generating the
+	# .pc file so that "libdir=${prefix}/@_INSTALL_LIBDIR@" never expands to a
+	# double-slash when Nix (or any other build system) supplies an absolute
+	# CMAKE_INSTALL_LIBDIR.  The install(TARGETS …) call below already does this
+	# normalisation for its own purposes; we just do it a few lines earlier.
+	if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+		file(RELATIVE_PATH CMAKE_INSTALL_LIBDIR "${CMAKE_INSTALL_PREFIX}" "${CMAKE_INSTALL_LIBDIR}")
+	endif()
 	generate_and_install_pkg_config_file(torrent-rasterbar libtorrent-rasterbar)
 endif()
 
