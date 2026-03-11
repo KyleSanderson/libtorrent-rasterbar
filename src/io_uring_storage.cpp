@@ -229,11 +229,6 @@ namespace aux {
 		std::vector<file_mapping_result> result;
 		file_storage const& fs = files();
 
-		// map from piece-space to file-space
-		// a single piece may span multiple files
-		std::int64_t const piece_offset = std::int64_t(static_cast<int>(piece))
-			* fs.piece_length() + offset;
-
 		auto const file_slices = fs.map_block(piece, offset, length);
 		for (auto const& s : file_slices)
 		{
@@ -266,7 +261,7 @@ namespace aux {
 		return result;
 	}
 
-	int io_uring_storage::read(settings_interface const& sett
+	int io_uring_storage::read(settings_interface const& /*sett*/
 		, span<char> buffer
 		, piece_index_t const piece, int const offset
 		, storage_error& error)
@@ -318,7 +313,7 @@ namespace aux {
 		});
 	}
 
-	int io_uring_storage::write(settings_interface const& sett
+	int io_uring_storage::write(settings_interface const& /*sett*/
 		, span<char> buffer
 		, piece_index_t const piece, int const offset
 		, storage_error& error)
