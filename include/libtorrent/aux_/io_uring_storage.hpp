@@ -167,7 +167,8 @@ namespace aux {
 		std::unique_ptr<posix_part_file> m_part_file;
 
 		// cache of open file descriptors
-		std::unordered_map<int, int> m_open_files; // file_index -> fd
+		// file_index -> {fd, writable}
+		std::unordered_map<int, std::pair<int, bool>> m_open_files;
 	};
 
 } // namespace aux

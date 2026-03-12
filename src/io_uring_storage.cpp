@@ -212,12 +212,21 @@ namespace aux {
 
 		auto it = m_open_files.find(file_idx);
 		if (it != m_open_files.end())
-			return it->second;
+		{
+			// If the caller needs write access but the cached fd is read-only,
+			// close it and re-open with O_RDWR so pwrite/io_uring writes don't
+			// silently fail with EBADF.
+			if (!write_mode || it->second.second)
+				return it->second.first;
+			// upgrade: close the read-only fd first
+			::close(it->second.first);
+			m_open_files.erase(it);
+		}
 
 		int flags = write_mode ? (O_RDWR | O_CREAT) : O_RDONLY;
 		int fd = open_file_impl(idx, flags, ec);
 		if (fd >= 0)
-			m_open_files[file_idx] = fd;
+			m_open_files[file_idx] = {fd, write_mode};
 		return fd;
 	}
 
@@ -296,20 +305,31 @@ namespace aux {
 
 			ec.operation = operation_t::file_read;
 
-			ssize_t const r = ::pread(fd, buf.data()
-				, static_cast<std::size_t>(buf.size())
-				, static_cast<off_t>(file_offset));
-			if (r < 0)
+			// pread may return fewer bytes than requested (EINTR, short read at
+			// EOF, etc.).  Loop until the buffer is full, we hit EOF (r==0), or
+			// an error occurs.  This matches the behaviour of fread-based
+			// posix_storage.
+			int total = 0;
+			while (total < static_cast<int>(buf.size()))
 			{
-				ec.ec.assign(errno, generic_category());
-				return -1;
+				ssize_t const r = ::pread(fd
+					, buf.data() + total
+					, static_cast<std::size_t>(buf.size()) - static_cast<std::size_t>(total)
+					, static_cast<off_t>(file_offset) + total);
+				if (r < 0)
+				{
+					if (errno == EINTR) continue;
+					ec.ec.assign(errno, generic_category());
+					return -1;
+				}
+				if (r == 0)
+				{
+					// EOF — let readwrite() decide whether that's an error
+					return total;
+				}
+				total += static_cast<int>(r);
 			}
-			if (r == 0)
-			{
-				ec.ec.assign(errors::file_too_short, libtorrent_category());
-				return -1;
-			}
-			return static_cast<int>(r);
+			return total;
 		});
 	}
 
@@ -347,21 +367,29 @@ namespace aux {
 
 			ec.operation = operation_t::file_write;
 
-			ssize_t const r = ::pwrite(fd, buf.data()
-				, static_cast<std::size_t>(buf.size())
-				, static_cast<off_t>(file_offset));
-			if (r < 0)
+			int total = 0;
+			while (total < static_cast<int>(buf.size()))
 			{
-				ec.ec.assign(errno, generic_category());
-				return -1;
-			}
-			if (r != static_cast<ssize_t>(buf.size()))
-			{
-				ec.ec.assign(errors::file_too_short, libtorrent_category());
+				ssize_t const r = ::pwrite(fd
+					, buf.data() + total
+					, static_cast<std::size_t>(buf.size()) - static_cast<std::size_t>(total)
+					, static_cast<off_t>(file_offset) + total);
+				if (r < 0)
+				{
+					if (errno == EINTR) continue;
+					ec.ec.assign(errno, generic_category());
+					return -1;
+				}
+				if (r == 0)
+				{
+					ec.ec.assign(errors::file_too_short, libtorrent_category());
+					return total;
+				}
+				total += static_cast<int>(r);
 			}
 
 			m_stat_cache.set_dirty(file_index);
-			return static_cast<int>(r);
+			return total;
 		});
 	}
 
@@ -388,17 +416,25 @@ namespace aux {
 						storage_error se;
 						int fd = open_file_fd(i, true, se);
 						if (se.ec) { ec = se; return; }
-						ssize_t const r = ::pwrite(fd, buf.data()
-							, static_cast<std::size_t>(buf.size())
-							, static_cast<off_t>(file_offset));
-						if (r < 0)
+						int total = 0;
+						while (total < static_cast<int>(buf.size()))
 						{
-							ec.ec.assign(errno, generic_category());
-							return;
-						}
-						if (r != static_cast<ssize_t>(buf.size()))
-						{
-							ec.ec.assign(errors::file_too_short, libtorrent_category());
+							ssize_t const r = ::pwrite(fd
+								, buf.data() + total
+								, static_cast<std::size_t>(buf.size()) - static_cast<std::size_t>(total)
+								, static_cast<off_t>(file_offset) + total);
+							if (r < 0)
+							{
+								if (errno == EINTR) continue;
+								ec.ec.assign(errno, generic_category());
+								return;
+							}
+							if (r == 0)
+							{
+								ec.ec.assign(errors::file_too_short, libtorrent_category());
+								return;
+							}
+							total += static_cast<int>(r);
 						}
 					}, fs.file_offset(i), fs.file_size(i), ec.ec);
 
@@ -459,7 +495,7 @@ namespace aux {
 		// close all cached file descriptors
 		for (auto& p : m_open_files)
 		{
-			if (p.second >= 0) ::close(p.second);
+			if (p.second.first >= 0) ::close(p.second.first);
 		}
 		m_open_files.clear();
 
