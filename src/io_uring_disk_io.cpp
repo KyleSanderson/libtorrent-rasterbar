@@ -282,6 +282,18 @@ struct TORRENT_EXTRA_EXPORT io_uring_disk_io final
 								});
 								return;
 							}
+							// A short read means the file is smaller than the
+							// declared piece size.  Report it as an error so the
+							// caller doesn't silently send a partial/zeroed block.
+							if (res < r.length)
+							{
+								e.ec.assign(errors::file_too_short, libtorrent_category());
+								e.operation = operation_t::file_read;
+								post(m_ios, [this, e, h = std::move(h)] {
+									h(disk_buffer_holder(m_buffer_pool, nullptr, 0), e);
+								});
+								return;
+							}
 							auto dur = total_microseconds(clock_type::now() - start_time);
 							m_stats_counters.inc_stats_counter(counters::num_blocks_read);
 							m_stats_counters.inc_stats_counter(counters::num_read_ops);

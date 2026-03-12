@@ -275,6 +275,11 @@ namespace aux {
 		, piece_index_t const piece, int const offset
 		, storage_error& error)
 	{
+		// Clear any stale error from a previous call.  Callers like async_hash
+		// reuse the same storage_error across a loop of block reads; if one block
+		// hits EOF the next would immediately false-fail via our early
+		// "if (ec.ec) return -1" guard in the lambda.
+		error = {};
 		return readwrite(files(), buffer, piece, offset, error
 			, [this](file_index_t const file_index
 				, std::int64_t const file_offset
@@ -324,7 +329,10 @@ namespace aux {
 				}
 				if (r == 0)
 				{
-					// EOF — let readwrite() decide whether that's an error
+					// EOF before satisfying the full request.  Match posix_storage
+					// behaviour: set file_too_short so readwrite() returns immediately
+					// rather than looping back and triggering a stale-ec false-fail.
+					ec.ec.assign(errors::file_too_short, libtorrent_category());
 					return total;
 				}
 				total += static_cast<int>(r);
@@ -338,6 +346,7 @@ namespace aux {
 		, piece_index_t const piece, int const offset
 		, storage_error& error)
 	{
+		error = {};
 		return readwrite(files(), buffer, piece, offset, error
 			, [this](file_index_t const file_index
 				, std::int64_t const file_offset

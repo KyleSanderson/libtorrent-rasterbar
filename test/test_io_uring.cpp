@@ -158,6 +158,188 @@ TORRENT_TEST(io_uring_storage_read_write)
 	cleanup("temp_storage");
 }
 
+// ---- io_uring_storage: read from a file that has never been written ----
+// Expect ENOENT (or similar open error), NOT a crash or silent zero-fill.
+TORRENT_TEST(io_uring_storage_read_nonexistent)
+{
+	cleanup("temp_storage");
+
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/test1.tmp", 2 * piece_size);
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// File was never written – reading any piece should fail with an
+	// OS-level error (ENOENT or equivalent), not silently return zeros.
+	std::vector<char> buf(piece_size);
+	int ret = st->read(set, buf, 0_piece, 0, se);
+	TEST_CHECK(se.ec);  // must report an error
+	TEST_EQUAL(ret, 0);
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
+// ---- io_uring_storage: read beyond actual file EOF → file_too_short ----
+// When a file on disk is shorter than the declared torrent size, a read
+// that starts inside valid data but extends past the actual EOF must
+// return the bytes it could read together with errors::file_too_short.
+TORRENT_TEST(io_uring_storage_read_short_file)
+{
+	cleanup("temp_storage");
+
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	// Declare a 3-piece file so there are pieces we can partially write.
+	fs.add_file("temp_storage/test1.tmp", 3 * piece_size);
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// Write only piece 0 – the file now has exactly piece_size bytes.
+	std::vector<char> piece0 = new_piece(piece_size);
+	int ret = st->write(set, piece0, 0_piece, 0, se);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);
+
+	// Read piece 0 back – should succeed.
+	std::vector<char> buf(piece_size);
+	ret = st->read(set, buf, 0_piece, 0, se);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == piece0);
+
+	// Read piece 2 (entirely beyond EOF) – must fail with file_too_short.
+	ret = st->read(set, buf, 2_piece, 0, se);
+	TEST_EQUAL(ret, 0);
+	TEST_CHECK(se.ec == lt::errors::file_too_short || se.ec == boost::asio::error::eof);
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
+// ---- io_uring_storage: stale error must not poison the next read call ----
+// Reproduces the async_hash bug: a storage_error left over from a failed
+// read (e.g. file_too_short or eof) must not cause the NEXT read – which
+// would succeed – to fail.  Before the fix, our lambda checked ec.ec on
+// entry and returned -1 immediately when the fd was already in the cache.
+TORRENT_TEST(io_uring_storage_stale_error_cleared)
+{
+	cleanup("temp_storage");
+
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/test1.tmp", 4 * piece_size);
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	// Reuse a single storage_error across calls, exactly like async_hash does.
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// Step 1: read a piece that doesn't exist yet → error (ENOENT / file_too_short).
+	std::vector<char> buf(piece_size);
+	int ret = st->read(set, buf, 0_piece, 0, se);
+	TEST_CHECK(se.ec);  // some error — file not there yet
+
+	// Step 2: write piece 0 with the SAME se (still has stale error from step 1).
+	std::vector<char> data = new_piece(piece_size);
+	ret = st->write(set, data, 0_piece, 0, se);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);  // write() must clear se
+
+	// Step 3: manually poison se with a stale eof, simulating a previous
+	// block read that hit EOF mid-piece (the async_hash pattern).
+	se.ec = boost::asio::error::eof;
+
+	// Step 4: read piece 0 back – write() wrote real data, se must be cleared
+	// by read() on entry, so the stale eof must NOT cause a false failure.
+	ret = st->read(set, buf, 0_piece, 0, se);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == data);
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
+// ---- io_uring_storage: write→read data-integrity sequence ----
+// Verifies the full write-then-hash-check round-trip for multiple pieces,
+// including the case where the same storage_error variable is reused for
+// every read (the async_hash calling pattern).
+TORRENT_TEST(io_uring_storage_write_read_roundtrip)
+{
+	cleanup("temp_storage");
+
+	constexpr int num_pieces = 8;
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/test1.tmp", num_pieces * piece_size);
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// Write all pieces (out-of-order to stress the fd cache).
+	std::vector<std::vector<char>> pieces(num_pieces);
+	for (int i = num_pieces - 1; i >= 0; --i)
+	{
+		pieces[i] = new_piece(piece_size);
+		int ret = st->write(set, pieces[i], piece_index_t(i), 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+	}
+
+	// Read back every piece using the SAME se, simulating async_hash.
+	// A stale error from any one piece must not corrupt the next.
+	for (int i = 0; i < num_pieces; ++i)
+	{
+		std::vector<char> buf(piece_size);
+		int ret = st->read(set, buf, piece_index_t(i), 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+		TEST_CHECK(buf == pieces[i]);
+	}
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
 // ---- io_uring_storage: rename file ----
 
 TORRENT_TEST(io_uring_storage_rename)
