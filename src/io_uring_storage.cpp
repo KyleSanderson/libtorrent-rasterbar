@@ -174,7 +174,12 @@ namespace aux {
 		{
 			ec.ec.assign(errno, generic_category());
 
-			if ((flags & O_WRONLY || flags & O_RDWR)
+			// Only attempt to create the file (and its parent directory) when
+			// O_CREAT was explicitly requested.  Without this guard, opening
+			// with O_RDWR (for a read request) on a missing file would fall
+			// through here and accidentally create an empty file.
+			if ((flags & O_CREAT)
+				&& (flags & O_WRONLY || flags & O_RDWR)
 				&& (ec.ec == boost::system::errc::no_such_file_or_directory))
 			{
 				ec.ec.clear();
@@ -186,7 +191,7 @@ namespace aux {
 					return -1;
 				}
 
-				fd = ::open(fn.c_str(), flags | O_CREAT, 0644);
+				fd = ::open(fn.c_str(), flags, 0644);
 				if (fd < 0)
 				{
 					ec.ec.assign(errno, generic_category());
@@ -210,23 +215,40 @@ namespace aux {
 	{
 		int const file_idx = static_cast<int>(idx);
 
+		// Always return the cached fd if one exists.  Every cached fd is opened
+		// O_RDWR so it can serve both reads and writes with the *same* fd —
+		// eliminating the upgrade-and-close pattern that caused a race.
+		//
+		// The race: if an async_read SQE is prepared (io_uring_prep_read) with
+		// fd=5, and then before io_uring_submit a write job closes fd=5 and
+		// opens a new O_RDWR fd=6, the kernel may recycle fd=5 for another file.
+		// When io_uring_submit runs, the read SQE points at the wrong (recycled)
+		// fd, producing wrong data or a short/zero read → file_too_short.
+		//
+		// By always opening O_RDWR up-front, no fd is ever closed while in use
+		// by a pending (not yet submitted) SQE.
 		auto it = m_open_files.find(file_idx);
 		if (it != m_open_files.end())
+			return it->second;
+
+		// For writes: O_RDWR | O_CREAT (create the file if absent).
+		// For reads:  O_RDWR without O_CREAT — opens an existing file O_RDWR so
+		//   a future write reuses the same fd without any upgrade.
+		//   If O_RDWR is denied (read-only mount / no write permission) fall
+		//   back to O_RDONLY so seeding from a read-only filesystem still works.
+		int flags = write_mode ? (O_RDWR | O_CREAT) : O_RDWR;
+		int fd = open_file_impl(idx, flags, ec);
+
+		if (!write_mode && fd < 0
+			&& (ec.ec == boost::system::errc::permission_denied
+				|| ec.ec == boost::system::errc::read_only_file_system))
 		{
-			// If the caller needs write access but the cached fd is read-only,
-			// close it and re-open with O_RDWR so pwrite/io_uring writes don't
-			// silently fail with EBADF.
-			if (!write_mode || it->second.second)
-				return it->second.first;
-			// upgrade: close the read-only fd first
-			::close(it->second.first);
-			m_open_files.erase(it);
+			ec = {};
+			fd = open_file_impl(idx, O_RDONLY, ec);
 		}
 
-		int flags = write_mode ? (O_RDWR | O_CREAT) : O_RDONLY;
-		int fd = open_file_impl(idx, flags, ec);
 		if (fd >= 0)
-			m_open_files[file_idx] = {fd, write_mode};
+			m_open_files[file_idx] = fd;
 		return fd;
 	}
 
@@ -337,6 +359,7 @@ namespace aux {
 				}
 				total += static_cast<int>(r);
 			}
+
 			return total;
 		});
 	}
@@ -504,7 +527,7 @@ namespace aux {
 		// close all cached file descriptors
 		for (auto& p : m_open_files)
 		{
-			if (p.second.first >= 0) ::close(p.second.first);
+			if (p.second >= 0) ::close(p.second);
 		}
 		m_open_files.clear();
 
@@ -634,6 +657,56 @@ namespace aux {
 			, aux::create_symlink
 			, [&ret](file_index_t, std::int64_t) { ret = ret | status_t::oversized_file; }
 			, ec);
+
+		// Pre-allocate every non-zero-length file to its declared size using
+		// ftruncate (sparse allocation – no actual disk blocks contributed for
+		// unfilled regions on supporting filesystems).
+		//
+		// Motivation: without pre-allocation, a file starts at 0 bytes and grows
+		// only as pieces are written.  If an async_hash (piece_verified) or a
+		// full check_files runs while the file is shorter than the piece offset
+		// being checked, pread returns 0 bytes → file_too_short → fatal disk
+		// error → torrent error state.  With pre-allocation the file is always
+		// the right size; unwritten regions read back as all-zeros, which simply
+		// fails the hash check (piece marked as missing → re-download), avoiding
+		// any disk error.
+		if (!ec)
+		{
+			for (auto const file_index : fs.file_range())
+			{
+				if (fs.pad_file_at(file_index)) continue;
+				if (file_index < m_file_priority.end_index()
+					&& m_file_priority[file_index] == dont_download)
+					continue;
+
+				std::int64_t const declared_size = fs.file_size(file_index);
+				if (declared_size <= 0) continue;
+
+				// Stat the file to check its current size.
+				std::string const fp = fs.file_path(file_index, m_save_path);
+				error_code stat_ec;
+				file_status fst;
+				stat_file(fp, &fst, stat_ec);
+
+				// Create (if missing) or extend (if too short) to declared size.
+				// Never shrink an oversized file (resumed or seeding data).
+				if (!stat_ec && fst.file_size >= declared_size) continue;
+
+				// open_file_impl with O_CREAT creates the file when it doesn't
+				// exist; when the file already exists it just opens it.
+				storage_error trunc_ec;
+				int fd = open_file_impl(file_index, O_RDWR | O_CREAT, trunc_ec);
+				if (fd < 0) continue;
+				if (::ftruncate(fd, static_cast<off_t>(declared_size)) < 0)
+				{
+					// Non-fatal on failure (e.g. disk full): writes/reads still
+					// work for regions that are actually written.
+					(void)0;
+				}
+				::close(fd);
+			}
+		}
+
 		return ret;
 	}
 

@@ -380,14 +380,25 @@ struct TORRENT_EXTRA_EXPORT io_uring_disk_io final
 							, static_cast<unsigned long long>(m.file_offset));
 
 						auto* cb = new sqe_cb{[this, buf_holder, start_time
-								, h = std::move(h)](int res) mutable
+							, m_length = m.length, h = std::move(h)](int res) mutable
+					{
+						// buf_holder keeps write buffer alive until here
+						buf_holder.reset();
+						storage_error e;
+						if (res < 0)
 						{
-							// buf_holder keeps write buffer alive until here
-							buf_holder.reset();
-							storage_error e;
-							if (res < 0)
-							{
-								e.ec.assign(-res, generic_category());
+							e.ec.assign(-res, generic_category());
+							e.operation = operation_t::file_write;
+							post(m_ios, [e, h = std::move(h)] { h(e); });
+							return;
+						}
+						// Detect short writes: io_uring IORING_OP_WRITE can return
+						// fewer bytes than requested (e.g. on a nearly-full disk).
+						// Reporting success here would cause async_hash to read back
+						// fewer bytes than expected, producing file_too_short.
+						if (res < m_length)
+						{
+							e.ec.assign(errors::file_too_short, libtorrent_category());
 								e.operation = operation_t::file_write;
 								post(m_ios, [e, h = std::move(h)] { h(e); });
 								return;
@@ -397,6 +408,7 @@ struct TORRENT_EXTRA_EXPORT io_uring_disk_io final
 							m_stats_counters.inc_stats_counter(counters::num_write_ops);
 							m_stats_counters.inc_stats_counter(counters::disk_write_time, dur);
 							m_stats_counters.inc_stats_counter(counters::disk_job_time, dur);
+
 							post(m_ios, [h = std::move(h)] { h(storage_error()); });
 						}};
 						io_uring_sqe_set_data(sqe, cb);
@@ -444,6 +456,25 @@ struct TORRENT_EXTRA_EXPORT io_uring_disk_io final
 		{
 			io_uring_storage* st = get_storage(storage);
 			if (!st) return;
+
+			// If there are any outstanding io_uring write SQEs queued in the
+			// same Phase 2 batch (e.g. prepare_write ran just before us in
+			// the same batch), they haven't been submitted/committed yet.
+			// Submit them now and wait for their CQEs so that any pread
+			// below sees the up-to-date page cache.
+			if (m_uring_ok && m_pending_sqes > 0)
+			{
+				io_uring_submit(&m_ring);
+				while (m_pending_sqes > 0)
+				{
+					struct io_uring_cqe* cqe = nullptr;
+					if (io_uring_wait_cqe(&m_ring, &cqe) < 0) break;
+					auto* cb2 = static_cast<sqe_cb*>(io_uring_cqe_get_data(cqe));
+					if (cb2) { cb2->fn(cqe->res); delete cb2; }
+					io_uring_cqe_seen(&m_ring, cqe);
+					--m_pending_sqes;
+				}
+			}
 
 			auto start_time = clock_type::now();
 

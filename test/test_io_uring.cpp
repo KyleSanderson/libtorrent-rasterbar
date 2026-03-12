@@ -42,6 +42,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/aux_/io_uring_storage.hpp"
 #include "libtorrent/aux_/io_uring_socket.hpp"
 #include "libtorrent/io_uring_disk_io.hpp"
+#include "libtorrent/posix_disk_io.hpp"
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/hasher.hpp"
 #include "libtorrent/session.hpp"
@@ -158,8 +159,11 @@ TORRENT_TEST(io_uring_storage_read_write)
 	cleanup("temp_storage");
 }
 
-// ---- io_uring_storage: read from a file that has never been written ----
-// Expect ENOENT (or similar open error), NOT a crash or silent zero-fill.
+// ---- io_uring_storage: read from never-written file returns zeros ----
+// initialize() pre-allocates every declared file to its full size using
+// ftruncate (sparse allocation).  Reads to unwritten regions return
+// all-zeros – no disk error.  The hash check then marks the piece as
+// missing and the torrent engine re-requests it, rather than aborting.
 TORRENT_TEST(io_uring_storage_read_nonexistent)
 {
 	cleanup("temp_storage");
@@ -180,12 +184,12 @@ TORRENT_TEST(io_uring_storage_read_nonexistent)
 	st->initialize(set, se);
 	TEST_CHECK(!se.ec);
 
-	// File was never written – reading any piece should fail with an
-	// OS-level error (ENOENT or equivalent), not silently return zeros.
+	// File pre-allocated by initialize() – reading any piece returns zeros.
 	std::vector<char> buf(piece_size);
 	int ret = st->read(set, buf, 0_piece, 0, se);
-	TEST_CHECK(se.ec);  // must report an error
-	TEST_EQUAL(ret, 0);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == std::vector<char>(piece_size, '\0'));
 
 	st->release_files();
 	cleanup("temp_storage");
@@ -229,10 +233,15 @@ TORRENT_TEST(io_uring_storage_read_short_file)
 	TEST_CHECK(!se.ec);
 	TEST_CHECK(buf == piece0);
 
-	// Read piece 2 (entirely beyond EOF) – must fail with file_too_short.
+	// Read piece 2 – with ftruncate pre-allocation the file is already
+	// declared_size bytes (3 pieces).  The unwritten region reads back as
+	// all-zeros: no disk error.  The resulting hash mismatch causes the
+	// piece to be re-requested, not a fatal torrent error.
+	se = {};
 	ret = st->read(set, buf, 2_piece, 0, se);
-	TEST_EQUAL(ret, 0);
-	TEST_CHECK(se.ec == lt::errors::file_too_short || se.ec == boost::asio::error::eof);
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == std::vector<char>(piece_size, '\0'));
 
 	st->release_files();
 	cleanup("temp_storage");
@@ -264,16 +273,18 @@ TORRENT_TEST(io_uring_storage_stale_error_cleared)
 	st->initialize(set, se);
 	TEST_CHECK(!se.ec);
 
-	// Step 1: read a piece that doesn't exist yet → error (ENOENT / file_too_short).
+	// Step 1: read piece 0 before writing – file is pre-allocated with zeros,
+	// so the read succeeds and returns a zeroed buffer (no error).
 	std::vector<char> buf(piece_size);
 	int ret = st->read(set, buf, 0_piece, 0, se);
-	TEST_CHECK(se.ec);  // some error — file not there yet
+	TEST_EQUAL(ret, piece_size);
+	TEST_CHECK(!se.ec);  // pre-allocation: read zero-region, no error
 
-	// Step 2: write piece 0 with the SAME se (still has stale error from step 1).
+	// Step 2: write piece 0 with the SAME se (already clear from step 1).
 	std::vector<char> data = new_piece(piece_size);
 	ret = st->write(set, data, 0_piece, 0, se);
 	TEST_EQUAL(ret, piece_size);
-	TEST_CHECK(!se.ec);  // write() must clear se
+	TEST_CHECK(!se.ec);  // write must succeed
 
 	// Step 3: manually poison se with a stale eof, simulating a previous
 	// block read that hit EOF mid-piece (the async_hash pattern).
@@ -687,9 +698,304 @@ TORRENT_TEST(io_uring_session_no_data)
 	cleanup("temp_storage");
 }
 
-// ---------------------------------------------------------------------------
-// io_uring_event_loop networking tests
-// ---------------------------------------------------------------------------
+// ---- multi-file torrent: write + read roundtrip ----
+// Verifies that pieces spanning a file boundary are correctly written and
+// read back.  The test writes all pieces out of order and reads them back,
+// exercising both the fd-cache reuse path and the cross-file readwrite path.
+TORRENT_TEST(io_uring_storage_multifile_write_read)
+{
+	cleanup("temp_storage");
+
+	// Two files of 2*piece_size each, 4 pieces total.
+	// Piece 1 spans the boundary between file0 and file1.
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/file0.tmp", 2 * piece_size);
+	fs.add_file("temp_storage/file1.tmp", 2 * piece_size);
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// Write all 4 pieces out of order (reverse) to stress the fd cache.
+	std::vector<std::vector<char>> pieces(4);
+	for (int i = 3; i >= 0; --i)
+	{
+		pieces[i] = new_piece(piece_size);
+		int const ret = st->write(set, pieces[i], piece_index_t(i), 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+	}
+
+	// Read back every piece and verify content.
+	for (int i = 0; i < 4; ++i)
+	{
+		std::vector<char> buf(piece_size);
+		int const ret = st->read(set, buf, piece_index_t(i), 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+		TEST_CHECK(buf == pieces[i]);
+	}
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
+// ---- fd reuse: read then write on the same file must not close the fd ----
+// Exercises the fix for the fd-use-after-close race: a read opens the file
+// O_RDWR; a subsequent write for a different piece of the same file must
+// return the same cached fd (no close-and-reopen) so any in-flight io_uring
+// read SQEs that reference that fd are not invalidated.
+TORRENT_TEST(io_uring_storage_fd_rdwr_reuse)
+{
+	cleanup("temp_storage");
+
+	constexpr int num_pieces = 8;
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/test.tmp", num_pieces * piece_size);
+	fs.set_num_pieces(num_pieces);
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+	auto st = std::make_shared<aux::io_uring_storage>(p);
+
+	aux::session_settings set;
+	storage_error se;
+	st->initialize(set, se);
+	TEST_CHECK(!se.ec);
+
+	// Write piece 7 first (high offset) so the file is extended.
+	std::vector<char> piece7 = new_piece(piece_size);
+	TEST_EQUAL(st->write(set, piece7, 7_piece, 0, se), piece_size);
+	TEST_CHECK(!se.ec);
+
+	// Now read piece 7 back.  This opens the file O_RDWR and caches the fd.
+	std::vector<char> buf(piece_size);
+	TEST_EQUAL(st->read(set, buf, 7_piece, 0, se), piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == piece7);
+
+	// Write piece 3 (lower offset, same file) — must reuse the cached fd,
+	// not close it and open a new one.
+	std::vector<char> piece3 = new_piece(piece_size);
+	TEST_EQUAL(st->write(set, piece3, 3_piece, 0, se), piece_size);
+	TEST_CHECK(!se.ec);
+
+	// Read piece 3 back via the same cached fd.
+	TEST_EQUAL(st->read(set, buf, 3_piece, 0, se), piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == piece3);
+
+	// Also verify piece 7 is still intact.
+	TEST_EQUAL(st->read(set, buf, 7_piece, 0, se), piece_size);
+	TEST_CHECK(!se.ec);
+	TEST_CHECK(buf == piece7);
+
+	st->release_files();
+	cleanup("temp_storage");
+}
+
+// ---- full hash-check roundtrip after partial download ----
+// Mimics the "resume with partial data" path: write one piece, restart,
+// then verify that:
+//  - the written piece reads back correctly (no error),
+//  - a piece whose offset is exactly at the file's end returns file_too_short,
+//  - a piece whose offset is beyond the file's end also returns file_too_short.
+// Note: sparse holes WITHIN the file's extent read as zeros (correct OS
+// behaviour) and do NOT produce an I/O error — the hash simply won't match.
+TORRENT_TEST(io_uring_storage_partial_download_hashcheck)
+{
+	cleanup("temp_storage");
+
+	constexpr int num_pieces = 6;
+	file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("temp_storage/test.tmp", num_pieces * piece_size);
+	fs.set_num_pieces(num_pieces);
+
+	std::string const test_path = current_working_directory();
+	aux::vector<download_priority_t, file_index_t> priorities;
+	sha1_hash info_hash;
+	storage_params p{fs, nullptr, test_path, storage_mode_sparse, priorities, info_hash};
+
+	// --- First "session": download only piece 0 ---
+	std::vector<char> piece0 = new_piece(piece_size);
+	{
+		auto st = std::make_shared<aux::io_uring_storage>(p);
+		aux::session_settings set;
+		storage_error se;
+		st->initialize(set, se);
+		TEST_CHECK(!se.ec);
+
+		TEST_EQUAL(st->write(set, piece0, 0_piece, 0, se), piece_size);
+		TEST_CHECK(!se.ec);
+		st->release_files();
+		// File on disk is now exactly piece_size bytes.
+	}
+
+	// --- Second "session": re-create storage and verify ---
+	{
+		auto st = std::make_shared<aux::io_uring_storage>(p);
+		aux::session_settings set;
+		storage_error se;
+		st->initialize(set, se);
+		TEST_CHECK(!se.ec);
+
+		storage_error ignore;
+		TEST_CHECK(st->has_any_file(ignore));  // file exists from first session
+
+		std::vector<char> buf(piece_size);
+
+		// Piece 0 was written and must be readable with no error.
+		se = {};
+		TEST_EQUAL(st->read(set, buf, 0_piece, 0, se), piece_size);
+		TEST_CHECK(!se.ec);
+		TEST_CHECK(buf == piece0);
+
+		// Pieces 1 and 3 were not written.  initialize() pre-allocates the
+		// file to the declared size using ftruncate, so unwritten regions read
+		// back as all-zeros – no disk error.  The hash mismatch causes the
+		// piece to be re-requested rather than aborting the torrent.
+		se = {};
+		int ret = st->read(set, buf, 1_piece, 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+		TEST_CHECK(buf == std::vector<char>(piece_size, '\0'));
+
+		se = {};
+		ret = st->read(set, buf, 3_piece, 0, se);
+		TEST_EQUAL(ret, piece_size);
+		TEST_CHECK(!se.ec);
+		TEST_CHECK(buf == std::vector<char>(piece_size, '\0'));
+
+		st->release_files();
+	}
+
+	cleanup("temp_storage");
+}
+
+// ---- full session download via io_uring disk i/o ----
+// Runs a real two-session download seeder→downloader, both using the
+// io_uring disk i/o backend, and verifies the downloader reaches seeding
+// state (all pieces verified).
+TORRENT_TEST(io_uring_session_download)
+{
+	std::string const seed_path = complete("seed_storage");
+	std::string const dl_path   = complete("dl_storage");
+	cleanup("seed_storage");
+	cleanup("dl_storage");
+
+	file_storage fs;
+	fs.add_file("seed_storage/data.tmp", 4 * piece_size);
+
+	lt::create_torrent t(fs, piece_size, create_torrent::v1_only);
+
+	std::vector<std::vector<char>> pieces(4);
+	for (int i = 0; i < 4; ++i)
+	{
+		pieces[i] = new_piece(piece_size);
+		t.set_hash(piece_index_t(i), hasher(pieces[i]).final());
+	}
+
+	std::vector<char> torrent_buf;
+	bencode(std::back_inserter(torrent_buf), t.generate());
+	auto info = std::make_shared<torrent_info>(torrent_buf, from_span);
+
+	// Write seed data to disk.
+	{
+		error_code ec;
+		create_directory(seed_path, ec);
+		int fd = ::open((seed_path + "/data.tmp").c_str()
+			, O_RDWR | O_CREAT | O_TRUNC, 0644);
+		TEST_CHECK(fd >= 0);
+		if (fd >= 0)
+		{
+			for (auto const& p : pieces)
+				(void)::write(fd, p.data(), p.size());
+			::close(fd);
+		}
+	}
+
+	// Seeder session — use default (posix) disk I/O for the seeder so the
+	// seeder is a known-good baseline, letting us isolate the downloader's
+	// io_uring disk backend.
+	settings_pack sp = settings();
+	sp.set_str(settings_pack::listen_interfaces, "127.0.0.1:0");
+	session_params seeder_sp;
+	seeder_sp.settings = sp;
+	lt::session seeder(std::move(seeder_sp));
+
+	add_torrent_params seed_atp;
+	seed_atp.ti = info;
+	seed_atp.save_path = complete(".");
+	torrent_handle seed_h = seeder.add_torrent(std::move(seed_atp));
+
+	// Wait for seeder to reach seeding state.
+	for (int i = 0; i < 100; ++i)
+	{
+		print_alerts(seeder, "seeder");
+		if (seed_h.status().state == torrent_status::seeding) break;
+		std::this_thread::sleep_for(lt::milliseconds(100));
+	}
+	TEST_CHECK(seed_h.status().state == torrent_status::seeding);
+
+	int const port = static_cast<int>(seeder.listen_port());
+	TEST_CHECK(port > 0);
+
+	// Downloader session with io_uring disk backend — this is what we're
+	// testing.
+	settings_pack dl_sp_pack = settings();
+	dl_sp_pack.set_str(settings_pack::listen_interfaces, "127.0.0.1:0");
+	session_params dl_sp;
+	dl_sp.settings = dl_sp_pack;
+	dl_sp.disk_io_constructor = lt::io_uring_disk_io_constructor;
+	lt::session downloader(std::move(dl_sp));
+
+	add_torrent_params dl_atp;
+	dl_atp.ti = info;
+	dl_atp.save_path = dl_path;
+	// Connect to seeder as a peer.
+	dl_atp.peers.push_back(lt::tcp::endpoint(
+		lt::address_v4::loopback(), static_cast<std::uint16_t>(port)));
+
+	torrent_handle dl_h = downloader.add_torrent(std::move(dl_atp));
+
+	torrent_status dl_st;
+	for (int i = 0; i < 300; ++i)
+	{
+		print_alerts(seeder,     "seeder");
+		print_alerts(downloader, "downloader");
+		dl_st = dl_h.status();
+		if (dl_st.state == torrent_status::seeding) break;
+		if (dl_st.errc)
+		{
+			std::cout << "downloader error: " << dl_st.errc.message() << "\n";
+			break;
+		}
+		std::this_thread::sleep_for(lt::milliseconds(100));
+	}
+
+	TEST_CHECK(dl_st.state == torrent_status::seeding);
+	TEST_CHECK(!dl_st.errc);
+
+	seeder.remove_torrent(seed_h);
+	downloader.remove_torrent(dl_h);
+	cleanup("seed_storage");
+	cleanup("dl_storage");
+}
+
+
 
 namespace {
 
